@@ -625,7 +625,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
 
   // For all features in the current frame, lets update their linear triangulation systems
   // Sum for each feature and if it has enough measurements, recover it
-  std::map<size_t, Eigen::Vector3d> hist_feat_inG_new;
+  std::map<size_t, Eigen::Vector3d> hist_feat_inG_new;        //当前帧特征点三角化得到的3d坐标
   std::map<size_t, Eigen::Matrix3d> hist_feat_linsys_A_new;
   std::map<size_t, Eigen::Vector3d> hist_feat_linsys_b_new;
   std::map<size_t, int> hist_feat_linsys_count_new;
@@ -754,7 +754,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
     double len01 = cv::norm((pts_left[tri.vertices[0]].pt - pts_left[tri.vertices[1]].pt));
     double len12 = cv::norm((pts_left[tri.vertices[1]].pt - pts_left[tri.vertices[2]].pt));
     double len20 = cv::norm((pts_left[tri.vertices[2]].pt - pts_left[tri.vertices[0]].pt));
-    if (len01 > options.max_tri_side_px || len12 > options.max_tri_side_px || len20 > options.max_tri_side_px) {
+    if (len01 > options.max_tri_side_px || len12 > options.max_tri_side_px || len20 > options.max_tri_side_px) {    //三角面片的2d像素边过长,skip
       tri_normals_inG.emplace_back(Eigen::Vector3d::Zero());
       continue;
     }

@@ -289,6 +289,8 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   }
 
   // Perform our feature tracking!
+  //作点特征的提取和追踪
+  //作平面的提取和追踪
   trackFEATS->feed_new_camera(message);
 
   // If the aruco tracker is available, the also pass to it

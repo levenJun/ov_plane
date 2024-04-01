@@ -256,11 +256,11 @@ protected:
 
   // Triangulated 3d position of each features and their linear systems
   std::mutex mtx_hist_vars;
-  std::map<size_t, Eigen::Vector3d> hist_feat_inG;
+  std::map<size_t, Eigen::Vector3d> hist_feat_inG;                          //特征点三角化得到的3d坐标.全局id
   std::map<size_t, Eigen::Matrix3d> hist_feat_linsys_A;
   std::map<size_t, Eigen::Vector3d> hist_feat_linsys_b;
   std::map<size_t, int> hist_feat_linsys_count;
-  std::map<size_t, std::vector<Eigen::Vector3d>> hist_feat_norms_inG;
+  std::map<size_t, std::vector<Eigen::Vector3d>> hist_feat_norms_inG;      //特征点,链接的三角面片的法向,有很多链接的三角面片,所有是法向数组.全局id
 
   // Record the tracking info
   double _tracking_time_total = 0.0;
