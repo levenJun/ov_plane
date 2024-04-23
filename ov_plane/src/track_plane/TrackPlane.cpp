@@ -478,7 +478,7 @@ void TrackPlane::feed_monocular(const CameraData &message, size_t msg_id) {
     // Detect new features
     std::vector<cv::KeyPoint> good_left;
     std::vector<size_t> good_ids_left;
-    perform_detection_monocular(imgpyr, mask, good_left, good_ids_left);
+    perform_detection_monocular(imgpyr, mask, good_left, good_ids_left);//首帧,单纯提特征
     // Save the current image and pyramid
     std::lock_guard<std::mutex> lckv(mtx_last_vars);
     time_last[cam_id] = message.timestamp;
@@ -587,7 +587,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
   // Get data from the previous image!
   double time;
   cv::Mat img, mask;
-  std::vector<cv::KeyPoint> pts_left;
+  std::vector<cv::KeyPoint> pts_left; //最近的上一帧,追踪到的有效特征点
   std::vector<size_t> ids_left;
   {
     // std::lock_guard<std::mutex> lckv(mtx_last_vars);
@@ -607,8 +607,19 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
 
   // Remove any old features that are not seen in this frame
   // NOTE: this won't work if we are doing loop-closure...
+  //将最近上帧追踪上的特征点作为有效特征,直接替换缓存的如下信息
+  // hist_feat_inG = tmp_hist_feat_inG;
+  // hist_feat_linsys_A = tmp_hist_feat_linsys_A;
+  // hist_feat_linsys_b = tmp_hist_feat_linsys_b;
+  // hist_feat_linsys_count = tmp_hist_feat_linsys_count;
+  // hist_feat_norms_inG = tmp_hist_feat_norms_inG;  
   remove_feats(ids_left);
 
+  //获取最近上帧的相机pose
+  //然后对最近上帧追踪上的特征点重新三角化,三角化中间结果和追踪结果刷新上面的 hist_feat_inG,hist_feat_linsys_A,hist_feat_linsys_b,hist_feat_linsys_count
+  //然后三角化失败的点(包含未作三角化的点)从pts_left中删除! (但是不影响上面几个缓存数据)
+
+  //获取最近上帧的相机pose
   // IMU historical clone
   Eigen::MatrixXd state = hist_state.at(time);
   Eigen::Matrix3d R_GtoI = quat_2_Rot(state.block(0, 0, 4, 1));
@@ -623,6 +634,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
   Eigen::Matrix3d R_GtoCi = R_ItoC * R_GtoI;
   Eigen::Vector3d p_CiinG = p_IinG - R_GtoCi.transpose() * p_IinC;
 
+  //然后对最近上帧追踪上的特征点重新三角化,三角化中间结果和追踪结果刷新上面的 hist_feat_inG,hist_feat_linsys_A,hist_feat_linsys_b,hist_feat_linsys_count
   // For all features in the current frame, lets update their linear triangulation systems
   // Sum for each feature and if it has enough measurements, recover it
   std::map<size_t, Eigen::Vector3d> hist_feat_inG_new;        //当前帧特征点三角化得到的3d坐标
@@ -692,7 +704,8 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
     for (auto const &pair : hist_feat_inG_new)
       hist_feat_inG[pair.first] = pair.second;
   }
-
+  
+  //然后三角化失败的点(包含未作三角化的点)从pts_left中删除! (但是不影响上面几个缓存数据)
   // Remove any points that do NOT have a 3d estimate yet...
   size_t sz_orig = pts_left.size();
   auto it0 = pts_left.begin();
@@ -712,6 +725,8 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
   // Delaunay Triangulation
   //====================================================================
 
+  //只对(单帧)最近上帧追踪成功且三角化成功的点,作CDT三角刨分
+  //且在二维像素平面上作三角刨分
   // Now lets perform our Delaunay Triangulation
   // https://github.com/artem-ogre/CDT
   std::vector<CDT::V2d<float>> tri_verts;
@@ -728,7 +743,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
   // Now for each vertex, lets calculate its normal given the current extracted "planes"
   // Loop through all triangulates, and assign each vertex the same normal
   // Then average each vertex's normal, along with the previous history....
-  std::map<size_t, std::set<size_t>> feat_to_close_feat;
+  std::map<size_t, std::set<size_t>> feat_to_close_feat;//存储单点临近的点 {点id, [临点id1, 临点id2, 临点id3 ..]}   //属于同一个三角面片认为是相邻点
   std::vector<Eigen::Vector3d> tri_normals_inG; // (0,0,0) if invalid
   for (auto const &tri : cdt.triangles) {
 
@@ -754,11 +769,12 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
     double len01 = cv::norm((pts_left[tri.vertices[0]].pt - pts_left[tri.vertices[1]].pt));
     double len12 = cv::norm((pts_left[tri.vertices[1]].pt - pts_left[tri.vertices[2]].pt));
     double len20 = cv::norm((pts_left[tri.vertices[2]].pt - pts_left[tri.vertices[0]].pt));
-    if (len01 > options.max_tri_side_px || len12 > options.max_tri_side_px || len20 > options.max_tri_side_px) {    //三角面片的2d像素边过长,skip
+    if (len01 > options.max_tri_side_px || len12 > options.max_tri_side_px || len20 > options.max_tri_side_px) {    //三角面片的2d像素边过长,skip(要求400像素内)
       tri_normals_inG.emplace_back(Eigen::Vector3d::Zero());
       continue;
     }
 
+    //三角形,叉乘求面片法向 norm,另外面片的顶点v,可以构成完整的平面点法方程: n^T*(pv) = n^T*(Ov) - n^T*(Op) = n^T*(Ov) - d = 0
     // Cross product first two to get the normal in G
     Eigen::Vector3d diff1 = hist_feat_inG.at(id2) - hist_feat_inG.at(id1);
     diff1 /= diff1.norm();
@@ -769,6 +785,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
 
     // To check the sign, we enforce that from the camera frame
     // We get a positive distance to it....
+    // 将平面方程转换到相机系下,并且保证法向是从相机O开始朝外
     Eigen::Vector3d p_FinCi = R_GtoCi * (hist_feat_inG.at(id1) - p_CiinG);
     Eigen::Vector3d norm_inCi = R_GtoCi * norm;
     if (norm_inCi.dot(p_FinCi) < 0)
@@ -776,6 +793,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
     tri_normals_inG.emplace_back(norm);
 
     // Record this normal for each feature
+    //将法向作为三个顶点共同法向,分别存储到各个顶点的法向记录中
     {
       // std::lock_guard<std::mutex> lckv(mtx_hist_vars);
 
@@ -801,7 +819,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
   // Calculate the average norm for each vertex
   std::map<size_t, Eigen::Vector3d> hist_feat_norms_sum_inG;
   for (auto const &featpair : hist_feat_norms_inG) {
-    hist_feat_norms_sum_inG[featpair.first] = avg_norm(featpair.second);
+    hist_feat_norms_sum_inG[featpair.first] = avg_norm(featpair.second);//计算法线均值,且通过法向标准差和最大差来判断有效性.标准差超过15度or最大差超过20度返回零法向.
     // hist_feat_norms_sum_inG[featpair.first] = featpair.second.at(featpair.second.size() - 1);
   }
 
@@ -811,16 +829,17 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
     pts_left_map[ids_left.at(i)] = pts_left.at(i);
   }
 
+  // 平面匹配
   // Find common norms between *features* to find plane matches
   // NOTE: We will threshold based on the angle between the two norms
   if (!cdt.triangles.empty()) {
     std::set<size_t> done_verts_ids;
-    for (auto const &featpair : hist_feat_norms_inG) {
+    for (auto const &featpair : hist_feat_norms_inG) {//featpair是单个特征点vs对应的法向值列表
 
       // Get current feature
-      size_t featid = featpair.first;
-      std::vector<Eigen::Vector3d> norms = featpair.second;
-      Eigen::Vector3d norm = hist_feat_norms_sum_inG.at(featid);
+      size_t featid = featpair.first;//单个特征点id
+      std::vector<Eigen::Vector3d> norms = featpair.second;//对应的法向值列表
+      Eigen::Vector3d norm = hist_feat_norms_sum_inG.at(featid);//单个特征点对应的法向均值
 
       // Skip if invalid norm
       if ((int)norms.size() < options.min_norms)
@@ -831,7 +850,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
       // Recover the CP of this plane (assume current point lies on a plane)
       Eigen::Vector3d p_FinG = hist_feat_inG.at(featid);
       // Eigen::Vector3d p_FinCi = R_GtoCi * (p_FinG - p_CiinG);
-      double d = p_FinG.dot(norm);
+      double d = p_FinG.dot(norm);//这是特征点所在平面,对应的平面截距d, 当前点所在平面方程就是 norm^T * p - d = 0;
       // Eigen::Vector3d cp_inG = d * norm;
       // Eigen::Matrix3d R_GtoPi;
       // ov_init::InitializerHelper::gram_schmidt(cp_inG, R_GtoPi);
@@ -844,14 +863,18 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
       if (feat_to_close_feat.find(featid) == feat_to_close_feat.end())
         continue;
 
+      //在滑窗范围内的特征寻找?
+      //在当前点的邻接点中去找匹配?
+        //匹配要求:临界点到当前点平面,法线差不超过10度,点到面距离不超过5厘米
+        //匹配结果:暂时都存进matches列表
       // Find all features that this feature connects to in the current window
       // Then we should compare to their norms and see if any "match" the current
       std::vector<size_t> matches;
-      for (auto const &featid_close : feat_to_close_feat.at(featid)) {
+      for (auto const &featid_close : feat_to_close_feat.at(featid)) {//从
         if (hist_feat_norms_inG.find(featid_close) == hist_feat_norms_inG.end())
           continue;
-        std::vector<Eigen::Vector3d> norms2 = hist_feat_norms_inG.at(featid_close);
-        Eigen::Vector3d norm2 = hist_feat_norms_sum_inG.at(featid_close);
+        std::vector<Eigen::Vector3d> norms2 = hist_feat_norms_inG.at(featid_close);//邻接点法向列表
+        Eigen::Vector3d norm2 = hist_feat_norms_sum_inG.at(featid_close);//邻接点法向均值
         if ((int)norms2.size() < options.min_norms)
           continue;
         if (norm2.norm() <= 0)
@@ -861,7 +884,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
 
         // Pairwise 2d image distance
         double len01 = cv::norm((pts_left_map.at(featid).pt - pts_left_map.at(featid_close).pt));
-        if (len01 > options.max_pairwise_px)
+        if (len01 > options.max_pairwise_px)//要求距离邻接点不超过300
           continue;
 
         // Compute the projection of the feature onto the plane
@@ -880,7 +903,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
         //  PRINT_ERROR(RED "[PLANE]: %zu -> %zu is %.2f, %.2f, %.2f in plane (%.2f deg, %.2f camxy, %.2f z)\n" RESET, featid, featid_close,
         //              p_FinPi(0), p_FinPi(1), p_FinPi(2), angle, camxy_dist, std::abs(plane_dist));
         //}
-        if (!std::isnan(angle) && angle < options.max_norm_deg && std::abs(plane_dist) < options.max_dist_between_z) {
+        if (!std::isnan(angle) && angle < options.max_norm_deg && std::abs(plane_dist) < options.max_dist_between_z) {//不超过10度,点到面距离不超过5厘米
           matches.emplace_back(featid_close);
         }
       }
@@ -893,6 +916,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
 
       // Then see if any of these features we match to are already classified as a plane
       // If they are, then we should merge them all to have the smallest plane id
+      // min_planeid:邻接点关联的所有平面特征中,最小的平面id
       int min_planeid = -1;
       if (hist_feat_to_plane.find(featid) != hist_feat_to_plane.end()) {
         min_planeid = (int)hist_feat_to_plane.at(featid);
@@ -914,23 +938,29 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
 
         // This function will change all features with the "old id"
         // To the new min plane id. Also change their connected and update plane history
+        // 以当前点为纽带,将属于同一个平面的 当前点的邻接点 都打包汇总到一起, 那么邻接点关联的平面特征也关联汇总到一起, 其中min_planeid是最小平面id, oldplaneid是单个普通平面id
+        // 下面的操作是,将关联的特征和平面都合并到一起
+        // 1)特征点对应的平面id全部替换为min_planeid
+        // 2)特征平面对应的oldplanes全部转移汇总到min_planeid
         auto update_plane_ids = [&](int min_planeid, size_t oldplaneid) {
           // skip if nothing to do..
           if ((size_t)min_planeid == oldplaneid)
             return;
           // update features to point to this new plane
+          // 1)特征点对应的平面id全部替换为min_planeid
           for (auto const &featpair_close : hist_feat_to_plane) {
             if (featpair_close.second == oldplaneid) {
               hist_feat_to_plane[featpair_close.first] = min_planeid;
             }
           }
           // update merged plane history map
+          // 2)特征平面对应的oldplanes全部转移汇总到min_planeid
           hist_plane_to_oldplanes[min_planeid].insert(oldplaneid);
           if (hist_plane_to_oldplanes.find(oldplaneid) != hist_plane_to_oldplanes.end()) {
             for (auto const &tmpoldplaneid : hist_plane_to_oldplanes.at(oldplaneid)) {
               hist_plane_to_oldplanes[min_planeid].insert(tmpoldplaneid);
             }
-            hist_plane_to_oldplanes.erase(oldplaneid);
+            hist_plane_to_oldplanes.erase(oldplaneid);//删除普通oldplaneid条目
           }
         };
 
@@ -986,6 +1016,9 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
   // Make sure our option is valid
   assert(options.filter_num_feat > 1);
 
+  //上面已经建立好关联了,下面作进一步处理
+
+  //在次新帧有效特征集合ids_left中,将相同平面的作汇总,以plane_id区分,结果到plane_to_feat
   // First build plane to feature global id (only active features)
   std::map<size_t, std::vector<size_t>> plane_to_feat;
   for (auto const &idpair : hist_feat_to_plane) {
@@ -1000,6 +1033,8 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
   // Calculate the N closest distance average for each feature
   // And for all the features in this plane, calculate the mean of this closet distance
   // then apply statistical filtering (which is similar to the consistency check z-test)
+  // check过滤不合格的点特征, 从hist_feat_to_plane中删除对应的点:hist_feat_to_plane.erase(feat_id);
+  // 方法:同一个平面的点组成点云集合,单个点求到K临近点的距离,然后用z-test来check
   for (auto const &idpairs : plane_to_feat) {
 
     // Make sure we have enough points for this plane
@@ -1060,11 +1095,12 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
   //====================================================================
   // Remove any planes that are not with an active feature set...
   //====================================================================
-
+  // hist_feat_to_plane = hist_feat_to_plane_tmp;              //严格筛选平面点:至少被次新帧3个点追踪上的大平面 对应的平面点
+  // hist_plane_to_oldplanes = hist_plane_to_oldplanes_tmp;    //严格筛选平面特征:至少被次新帧3个点追踪上的大平面特征
   {
     // create a list of planes which are currently being actively tracked
     // this can be found by grouping planes which are seen from the active ids of the system
-    std::map<size_t, size_t> hist_feat_to_plane_tmp;
+    std::map<size_t, size_t> hist_feat_to_plane_tmp; //将平面点中 属于次新帧全部拎出来
     std::map<size_t, std::set<size_t>> hist_plane_to_oldplanes_tmp;
     for (auto const &id : ids_left) {
       if (hist_feat_to_plane.find(id) != hist_feat_to_plane.end()) {
@@ -1073,25 +1109,26 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
     }
     // now loop through and remove any planes that have a very small number of features
     // this can happen if features go out of view, or we just had a single (or two) pairwise matches
-    std::map<size_t, size_t> plane2featct;
+    std::map<size_t, size_t> plane2featct;          //所有被次新帧追終上的平面,累积有多个点追踪上同一个平面
     for (auto const &tmp : hist_feat_to_plane_tmp) {
       plane2featct[tmp.second]++;
     }
-    hist_feat_to_plane_tmp.clear();
+    hist_feat_to_plane_tmp.clear();                 //将平面点中 属于次新帧全部拎出来. 且只保留至少被3个点追踪上的平面 对应的平面点
     for (auto const &id : ids_left) {
       if (hist_feat_to_plane.find(id) != hist_feat_to_plane.end() && plane2featct.at(hist_feat_to_plane.at(id)) > 3) {
         hist_feat_to_plane_tmp.insert({id, hist_feat_to_plane.at(id)});
       }
     }
     // now update the history of plane merges for those that are active and large!
+    // hist_plane_to_oldplanes_tmp: 被次新帧至少被3个点追踪上的平面
     for (auto const &idpair : hist_feat_to_plane_tmp) {
       if (hist_plane_to_oldplanes.find(idpair.second) != hist_plane_to_oldplanes.end()) {
         hist_plane_to_oldplanes_tmp.insert({idpair.second, hist_plane_to_oldplanes.at(idpair.second)});
       }
     }
     // std::lock_guard<std::mutex> lckv(mtx_hist_vars);
-    hist_feat_to_plane = hist_feat_to_plane_tmp;
-    hist_plane_to_oldplanes = hist_plane_to_oldplanes_tmp;
+    hist_feat_to_plane = hist_feat_to_plane_tmp;              //严格筛选平面点:至少被次新帧3个点追踪上的大平面 对应的平面点
+    hist_plane_to_oldplanes = hist_plane_to_oldplanes_tmp;    //严格筛选平面特征:至少被次新帧3个点追踪上的大平面特征
   }
 
   // Finally save the display
@@ -1120,6 +1157,9 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
   _tracking_time_total = (rTP5 - rTP1).total_microseconds() * 1e-6;
 }
 
+//计算法线均值,且通过法向i和法向均值对比的标准差和最大差来判断有效性.
+//法向均值:数值求平均
+//有效性check:标准差不超过15度,最大差不超过20度
 Eigen::Vector3d TrackPlane::avg_norm(const std::vector<Eigen::Vector3d> &norms) const {
 
   // TODO: should this be rotation averaging?
@@ -1165,6 +1205,7 @@ Eigen::Vector3d TrackPlane::avg_norm(const std::vector<Eigen::Vector3d> &norms) 
   // std::cout << "average = " << sum.transpose() << std::endl;
   // std::cout << "var = " << var.diagonal().cwiseSqrt().transpose() << std::endl;
   // std::cout << "var_deg = " << std::sqrt(var_deg) << " | max_deg = " << max_deg << std::endl;
+  //法向差量,标准差不超过15度,最大值不超过20度
   if (std::sqrt(var_deg) > options.max_norm_avg_var || max_deg > options.max_norm_avg_max)
     return Eigen::Vector3d::Zero();
   return sum;
