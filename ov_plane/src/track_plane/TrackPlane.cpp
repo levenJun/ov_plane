@@ -460,6 +460,15 @@ void TrackPlane::get_tracking_info(PlaneTrackingInfo &track_info) {
   track_info.tracking_time = _tracking_time_total;
 }
 
+//1)先在次新帧范围内,作大平面特征提取和匹配关联
+  //次新帧三角化成功的点,能生成小平面法向和邻接点集合
+  //从面片小平面扩展得到大平面特征,扩展的大平面无历史关联即新建,有历史关联即融合
+    //此即实现了大平面特征提取,大平面特征关联,大平面调整和点特征关联
+//2)再对次新帧补新点
+//3)次新帧和最新帧作光流匹配
+  //光流匹配成功的视觉观测加入特征数据库:database->update_feature.
+    //已有的老点,迭加观测
+    //补充的新点,新增新点
 void TrackPlane::feed_monocular(const CameraData &message, size_t msg_id) {
 
   // Lock this data feed for this camera
@@ -577,6 +586,36 @@ void TrackPlane::feed_monocular(const CameraData &message, size_t msg_id) {
   PRINT_DEBUG("[TIME]: %.4f seconds for total\n", (rT6 - rT1).total_microseconds() * 1e-6);
 }
 
+//总步骤概述:
+// 1)次新帧的点作三角化,三角化成功的点作三角刨分,三角刨分成功得到小面片,点特征也能得到面片法向
+// 2)次新帧的三角面片作融合扩展大平面特征.
+  // 扩展成功的形成大平面特征,扩展大平面要么关联上老的大平面要么新建大平面.
+  // 融合扩展这一步也能将次新帧的点特征和大平面特征建立关联.
+
+//流程详述
+//1)次新帧特征点作三角化
+//2)只对(单帧)次新帧追踪成功且三角化成功的点,作CDT三角刨分
+//3)对上面有效点,在三维空间计算次新帧上的小平面法向,并汇总单点的历史小平面法向作为单点的小平面总法向:hist_feat_norms_sum_inG
+//4)只在次新帧范围内建立邻接点关系:feat_to_close_feat:{点id, [临点id1, 临点id2, 临点id3 ..]}
+//5)对单点,遍历其邻接点,尝试作平面匹配:小平面法向不超过10度,点到面距离不超过5厘米
+  //单点匹配成功的邻接点对,放到同一个集合-matches
+  //对匹配集合matches作大平面关联合并
+    // matches中有点关联上过大平面特征,取最老的大平面特征作为min_planeid,集合中所有点都重新关联大平面min_planeid,且所有大平面全部融合进min_planeid
+    // matches中所有点都没有关联上过大平面特征,就新建大平面特征(但是这里只是新建了大平面id:temp = ++currplaneid),所有点关联新建大平面temp
+//6)hist_feat_to_plane的点作z-test,删除不合格的点
+//7)严格筛选平面点:至少被次新帧3个点追踪上的大平面 对应的平面点:hist_feat_to_plane = hist_feat_to_plane_tmp;
+//8)严格筛选平面特征:至少被次新帧3个点追踪上的大平面特征:      hist_plane_to_oldplanes = hist_plane_to_oldplanes_tmp;
+
+//关键数据结构:
+  // pts_left-次新帧追踪成功且三角化成功的点
+  // feat_to_close_feat[id]-存储[!!次新帧内!!]单点临近的点 {点id, [临点id1, 临点id2, 临点id3 ..]}   //属于同一个三角面片认为是相邻点
+  // hist_feat_norms_inG[id]-单点历史面片的法向集合 {点id, [法向1, 法向2, 法向3 ..]} 
+  // hist_feat_norms_sum_inG[id]-单点的总法向:取历史法向的均值
+  // tri_normals_inG-单点在次新帧单帧内的法向
+  // matches-在次新帧范围内,单点特征featid平面扩展匹配上的点列表
+  // hist_feat_to_plane[featid]-单点特征featid关联到的大平面特征
+  // hist_feat_to_plane = hist_feat_to_plane_tmp;              //严格筛选平面点:至少被次新帧3个点追踪上的大平面 对应的平面点
+  // hist_plane_to_oldplanes = hist_plane_to_oldplanes_tmp;    //严格筛选平面特征:至少被次新帧3个点追踪上的大平面特征  
 void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
 
   // Lock the system
@@ -869,8 +908,8 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
         //匹配结果:暂时都存进matches列表
       // Find all features that this feature connects to in the current window
       // Then we should compare to their norms and see if any "match" the current
-      std::vector<size_t> matches;
-      for (auto const &featid_close : feat_to_close_feat.at(featid)) {//从
+      std::vector<size_t> matches;//在次新帧范围内,单点特征featid平面扩展匹配上的点id
+      for (auto const &featid_close : feat_to_close_feat.at(featid)) {//对点特征 featid ,在其次新帧的邻接点集范围去匹配?
         if (hist_feat_norms_inG.find(featid_close) == hist_feat_norms_inG.end())
           continue;
         std::vector<Eigen::Vector3d> norms2 = hist_feat_norms_inG.at(featid_close);//邻接点法向列表
@@ -903,7 +942,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
         //  PRINT_ERROR(RED "[PLANE]: %zu -> %zu is %.2f, %.2f, %.2f in plane (%.2f deg, %.2f camxy, %.2f z)\n" RESET, featid, featid_close,
         //              p_FinPi(0), p_FinPi(1), p_FinPi(2), angle, camxy_dist, std::abs(plane_dist));
         //}
-        if (!std::isnan(angle) && angle < options.max_norm_deg && std::abs(plane_dist) < options.max_dist_between_z) {//不超过10度,点到面距离不超过5厘米
+        if (!std::isnan(angle) && angle < options.max_norm_deg && std::abs(plane_dist) < options.max_dist_between_z) {//法向不超过10度,点到面距离不超过5厘米
           matches.emplace_back(featid_close);
         }
       }
@@ -998,7 +1037,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
       }
 
       // If none of the features have a plane, then we will assign a new plane id and add them all to it!
-      if (min_planeid == -1) {
+      if (min_planeid == -1) {//单点 featid 和其邻接点,都没有关联上大平面特征,就新建大平面特征(但是这里只是新建了大平面id)
         size_t temp = ++currplaneid;
         // std::lock_guard<std::mutex> lckv(mtx_hist_vars);
         for (auto const &featid_close : matches)
@@ -1018,7 +1057,8 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
 
   //上面已经建立好关联了,下面作进一步处理
 
-  //在次新帧有效特征集合ids_left中,将相同平面的作汇总,以plane_id区分,结果到plane_to_feat
+  //在次新帧有效特征集合ids_left中,将相同平面的点分别汇总到对应平面,以plane_id区分,结果到plane_to_feat
+  //plane_to_feat[plane_id]-次新帧中属于同一个平面plane_id的有效点
   // First build plane to feature global id (only active features)
   std::map<size_t, std::vector<size_t>> plane_to_feat;
   for (auto const &idpair : hist_feat_to_plane) {
