@@ -28,12 +28,13 @@
 
 using namespace ov_plane;
 
+//点面距离构成的观测残差
 Factor_PointOnPlane::Factor_PointOnPlane(double sigma_c_) : sigma_c(sigma_c_) {
 
   // Parameters we are a function of
-  set_num_residuals(1);
-  mutable_parameter_block_sizes()->push_back(3); // p_FinG
-  mutable_parameter_block_sizes()->push_back(3); // cp_inG
+  set_num_residuals(1);                                        //面特征观测总残差结果是1维
+  mutable_parameter_block_sizes()->push_back(3); // p_FinG     //残差对点特征
+  mutable_parameter_block_sizes()->push_back(3); // cp_inG     //残差对面特征
 }
 
 bool Factor_PointOnPlane::Evaluate(double const *const *parameters, double *residuals, double **jacobians) const {
@@ -43,26 +44,26 @@ bool Factor_PointOnPlane::Evaluate(double const *const *parameters, double *resi
   Eigen::Vector3d cp_inG = Eigen::Map<const Eigen::Vector3d>(parameters[1]);
 
   // Recover cp info
-  double d_inG = cp_inG.norm();
-  Eigen::Vector3d n_inG = cp_inG / d_inG;
+  double d_inG = cp_inG.norm();                     //将面特征参数解封:模长是截距d
+  Eigen::Vector3d n_inG = cp_inG / d_inG;           //将面特征参数解封:单位向量是逆法向-n
 
   // Compute residual
   // NOTE: we make this negative ceres cost function is only min||f(x)||^2
   // TODO: is this right? it optimizes if we flip this sign...
   double white_c = 1.0 / sigma_c;
-  residuals[0] = -1.0 * white_c * (0.0 - (n_inG.transpose() * p_FinG - d_inG));
+  residuals[0] = -1.0 * white_c * (0.0 - (n_inG.transpose() * p_FinG - d_inG));     //点面距离公式(但是为什么多了一个负号?)
 
   // Compute jacobians if requested by ceres
   if (jacobians) {
 
     // Jacobian wrt feature p_FinG
-    if (jacobians[0]) {
+    if (jacobians[0]) {                                                             //残差对点Pw的雅可比
       Eigen::Map<Eigen::Matrix<double, 1, 3, Eigen::RowMajor>> jacobian(jacobians[0]);
       jacobian.block(0, 0, 1, 3) = white_c * n_inG.transpose();
     }
 
     // Jacobian wrt cp_inG
-    if (jacobians[1]) {
+    if (jacobians[1]) {                                                             //残差对点平面参数的雅可比
       Eigen::Map<Eigen::Matrix<double, 1, 3, Eigen::RowMajor>> jacobian(jacobians[1]);
       jacobian.block(0, 0, 1, 3) =
           white_c * 1.0 / d_inG * (p_FinG.transpose() - n_inG.transpose() * p_FinG * n_inG.transpose() - d_inG * n_inG.transpose());

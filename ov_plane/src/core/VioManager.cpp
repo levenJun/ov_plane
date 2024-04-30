@@ -346,6 +346,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Also augment it with a new clone!
   // NOTE: if the state is already at the given time (can happen in sim)
   // NOTE: then no need to prop since we already are at the desired timestep
+  // imu运动积分
+  // imu状态到相机状态的扩增
   if (state->_timestamp != message.timestamp) {
     propagator->propagate_and_clone(state, message.timestamp);
   }
@@ -374,6 +376,12 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // Now, lets get all features that should be used for an update that are lost in the newest frame
   // We explicitly request features that have not been deleted (used) in another update step
+
+  //特征拆分:
+  // featsup_MSCKF特征:
+  // feats_slam 特征:      
+      //feats_slam_UPDATE :直接作滑窗eskf后验刷新的slam特征
+      //feats_slam_DELAYED:先新建初始化添加进滑窗状态,然后作eskf后验刷新的新增slam特征.
   std::vector<std::shared_ptr<Feature>> feats_lost, feats_marg, feats_slam;
   feats_lost = trackFEATS->get_feature_database()->features_not_containing_newer(state->_timestamp, false, true);
 
@@ -484,11 +492,11 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Lets marginalize out all old SLAM features here
   // These are ones that where not successfully tracked into the current frame
   // We do *NOT* marginalize out our aruco tags landmarks
-  StateHelper::marginalize_slam(state);
+  StateHelper::marginalize_slam(state); //追踪丢失的slam特征会被边缘化掉?
 
   // Separate our SLAM features into new ones, and old ones
   std::set<size_t> feat_do_not_add;
-  std::vector<std::shared_ptr<Feature>> feats_slam_DELAYED, feats_slam_UPDATE;
+  std::vector<std::shared_ptr<Feature>> feats_slam_DELAYED, feats_slam_UPDATE;  //已经在滑窗内的slam特征作为feats_slam_UPDATE,其余的作为feats_slam_DELAYED
   for (size_t i = 0; i < feats_slam.size(); i++) {
     feat_do_not_add.insert(feats_slam.at(i)->featid);
     if (state->_features_SLAM.find(feats_slam.at(i)->featid) != state->_features_SLAM.end()) {
@@ -515,8 +523,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // NOTE: Also we will merge any SLAM planes together if the frontend combined them here
   // NOTE: This should only happen in the realworld as in SIM, planes are fixed ids
   // NOTE: Any planes not actively seen will be marginalized here
-  std::map<size_t, size_t> feat2plane;
-  std::map<size_t, std::set<size_t>> plane2oldplane;
+  std::map<size_t, size_t> feat2plane;                //次新帧追踪上的小平面点
+  std::map<size_t, std::set<size_t>> plane2oldplane;  //次新帧新增的大平面特征 or 追踪上的大平面特征
   std::shared_ptr<TrackPlane> trackPlane = nullptr;
   TrackPlane::PlaneTrackingInfo track_info;
   if ((int)state->_clones_IMU.size() > state->_options.max_clone_size || (int)state->_clones_IMU.size() > 5) {
@@ -531,19 +539,20 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
       if (trackPlaneSIM != nullptr) {
         feat2plane = sim_map_feat2plane;
       }
+      //check滑窗中的大平面特征,要么被追踪上作大平面融合;要么被边缘化掉!
       StateHelper::merge_planes_and_marginalize(state, feat2plane, plane2oldplane);
     }
   }
 
   // Count how many features are on the plane
-  std::map<size_t, size_t> plane2featct;
+  std::map<size_t, size_t> plane2featct;//大平面对应的追踪点计数
   for (auto const &tmp : feat2plane) {
     plane2featct[tmp.second]++;
   }
 
   // Seperate our MSCKF features into ones that lie on a plane and those that do not
-  std::set<size_t> current_planes;
-  std::vector<std::shared_ptr<Feature>> featsup_MSCKF_plane;
+  std::set<size_t> current_planes;                            //与MSCKF特征有关的  大平面特征
+  std::vector<std::shared_ptr<Feature>> featsup_MSCKF_plane;  //被大平面追踪上的    MSCKF特征
   for (auto const &feat : featsup_MSCKF_tmp) {
     feat_do_not_add.insert(feat->featid);
     if (feat2plane.find(feat->featid) != feat2plane.end()) {
@@ -555,24 +564,27 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Get more MSCKF features for each plane if we have them
   // If we have an active feature that has 5 or more measurements
   // Then we should try to use it in this update since it lies on the plane...
+  //再进一步补充 被大平面追踪上的MSCKF特征:featsup_MSCKF_plane 
+  //补充来源:其他有效的小特征(msckf特征或者slam特征都可),但是要求特征点自己的单相机观测数目大于阈值
   if (state->_options.plane_collect_init_feats) {
-    for (auto const &featplanepair : feat2plane) {
+    for (auto const &featplanepair : feat2plane) {//遍历所有小平面点, 取出小特征和匹配的大平面特征
       size_t featid = featplanepair.first;
       size_t planeid = featplanepair.second;
       // skip if this plane is not been selected for use yet
-      if (current_planes.find(planeid) == current_planes.end())
+      // 正式处理前,对小特征和大平面特征作check过滤
+      if (current_planes.find(planeid) == current_planes.end())//大平面特征 要求必须是MSCKF特征追上的大平面特征
         continue;
       // skip if the feature is a slam feature
-      if (feat_do_not_add.find(featid) != feat_do_not_add.end())
+      if (feat_do_not_add.find(featid) != feat_do_not_add.end())//小特征 要求必须是有效的slam特征或者msckf特征   //leven:疑问?feat_do_not_add包含slam特征+msckf特征吧?
         continue;
       // skip if this plane has not that many in it
-      if (plane2featct.at(planeid) < 4)
+      if (plane2featct.at(planeid) < 4)//要求大平面被至少4个点追上
         continue;
       // else lets get it from our feature database to update with!
       std::shared_ptr<Feature> feat = trackFEATS->get_feature_database()->get_feature(featid);
       if (feat != nullptr) {
-        int ct_clones = 0;
-        for (const auto &pair : feat->timestamps)
+        int ct_clones = 0;//特征观测的单相机下的最大计数
+        for (const auto &pair : feat->timestamps)//单个pair是此特征在单个相机下的所有观测
           ct_clones = std::max(ct_clones, (int)feat->timestamps[pair.first].size());
         if (ct_clones > state->_options.max_clone_size - 1) {
           featsup_MSCKF_plane.push_back(feat);

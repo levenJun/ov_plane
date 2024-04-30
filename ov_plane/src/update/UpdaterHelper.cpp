@@ -192,6 +192,13 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
   assert(false);
 }
 
+// 1)等效于点特征的jacobian_full计算
+// 2)额外,如果点特征和大平面有关联,就还考虑点面残差:
+//    2-1)点面残差, 叠加到 res 末尾
+//    2-2)对点特征雅可比, 叠加到 H_x末尾
+//    2-3)对面特征雅可比H_c_plane, 
+//        2-3-1)如果面特征在滑窗 _features_PLANE 中, 面特征作为状态叠加到H_x末尾
+//        2-3-1)如果面特征不在滑窗中(新面特征), 面特征作为特征叠加到H_f末尾
 void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, UpdaterHelperFeature &feature, double sigma_px, double sigma_c,
                                               Eigen::MatrixXd &H_f, Eigen::MatrixXd &H_x, Eigen::VectorXd &res,
                                               std::vector<std::shared_ptr<Type>> &x_order) {
@@ -266,6 +273,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
   }
 
   // Append the plane to the Jacobian if we have it in our state!
+  // 额外将大平面面特征也添加到状态列表中.
   bool plane_in_state = (state->_features_PLANE.find(feature.planeid) != state->_features_PLANE.end());
   if (feature.planeid != 0 && plane_in_state) {
     std::shared_ptr<Vec> planecp = state->_features_PLANE.at(feature.planeid);
@@ -423,6 +431,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       //=========================================================================
 
       // Derivative of p_FinCi in respect to camera calibration (R_ItoC, p_IinC)
+      // 畸变后像素uv 对 IMU到相机外参的雅可比
       if (state->_options.do_calib_camera_pose) {
 
         // Calculate the Jacobian
@@ -445,6 +454,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
   }
 
   // Apply point-on-plane contraint if we have a plane!
+  // 当前点还是关联了大平面特征,考虑点面残差,计算对点和面特征的雅可比
   if (feature.planeid != 0) {
 
     auto add_constraint = [&]() {

@@ -228,6 +228,10 @@ void StateHelper::set_initial_covariance(std::shared_ptr<State> state, const Eig
   state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
 }
 
+// 从大的协方差矩阵上拷贝截取一部分子协方差块
+  // 大协方差矩阵:滑窗状态总的协方差P
+  // 滑窗总状态:state. 目标状态:small_variables
+  // 小协方差矩阵:就拷贝目标状态对应的协方差矩阵
 Eigen::MatrixXd StateHelper::get_marginal_covariance(std::shared_ptr<State> state,
                                                      const std::vector<std::shared_ptr<Type>> &small_variables) {
 
@@ -651,6 +655,12 @@ void StateHelper::marginalize_slam(std::shared_ptr<State> state) {
   }
 }
 
+//check滑窗中的大平面特征
+//check1:滑窗大平面特征被次新帧追踪上了
+    // 1-1)追踪大平面不在滑窗中: 那么对于滑窗状态,直接将滑窗大平面planeid替换为追踪大平面planeid_new
+    // 1-2)追踪大平面也在滑窗中: 那么就直接融合滑窗大平面planeid和追踪大平面planeid_new
+        // 融合滑窗中两个大平面: 构建两个大平面特征残差,作滑窗的ESKF刷新; 直接边缘化掉滑窗中的大平面特征,保留追踪上的大平面
+//check2:滑窗中大平面特征没有被追踪到,就被直接边缘化掉对应大平面,并从滑窗中删除
 void StateHelper::merge_planes_and_marginalize(std::shared_ptr<State> state, const std::map<size_t, size_t> &feat2plane,
                                                const std::map<size_t, std::set<size_t>> &plane2oldplane) {
 
@@ -660,22 +670,22 @@ void StateHelper::merge_planes_and_marginalize(std::shared_ptr<State> state, con
 
   // Else we should loop through all planes and see if we should merge them
   auto it5 = state->_features_PLANE.begin();
-  while (it5 != state->_features_PLANE.end()) {
+  while (it5 != state->_features_PLANE.end()) { 
 
     // Find the plane id of the plane we should merge into
     // This plane needs to be in the state also
-    size_t planeid = (*it5).first;
+    size_t planeid = (*it5).first;                                //it5/planeid是滑窗中大平面特征
     int planeid_new = -1;
     bool in_state = false;
-    for (auto const &planeset : plane2oldplane) {
-      if (planeset.second.find(planeid) != planeset.second.end()) {
+    for (auto const &planeset : plane2oldplane) {                 //planeset是次新帧特征追踪到的大平面特征
+      if (planeset.second.find(planeid) != planeset.second.end()) {//这个滑窗大平面planeid被次新帧追踪上了,且对应为追踪大平面planeset
         planeid_new = (int)planeset.first;
-        in_state = (state->_features_PLANE.find(planeset.first) != state->_features_PLANE.end());
+        in_state = (state->_features_PLANE.find(planeset.first) != state->_features_PLANE.end());//追踪大平面planeset也刚好在滑窗状态中
       }
     }
 
     // skip if we didn't find a plane to merge
-    if (planeid_new == -1 || (int)planeid == planeid_new) {
+    if (planeid_new == -1 || (int)planeid == planeid_new) {     //追踪上的滑窗大平面planeid和对应的追踪平面planeid_new刚好一致,无需作merge操作了
       it5++;
       continue;
     }
@@ -685,10 +695,10 @@ void StateHelper::merge_planes_and_marginalize(std::shared_ptr<State> state, con
     // 2. if both are in the state, then we should update to merge them...
     PRINT_INFO(BOLDRED "[PLANE-MARG]: plane %zu will merge with %d (%s)\n" RESET, planeid, planeid_new,
                ((in_state) ? "in state" : "out of state"));
-    if (!in_state) {
+    if (!in_state) {                                            //追踪大平面planeid_new,不在滑窗状态中,那么对于滑窗状态,直接将滑窗大平面planeid替换为追踪大平面
       state->_features_PLANE.insert({planeid_new, state->_features_PLANE.at(planeid)});
       it5 = state->_features_PLANE.erase(it5);
-    } else {
+    } else {                                                    //追踪大平面planeid_new,也在滑窗状态中,那么就直接融合滑窗大平面planeid和追踪大平面planeid_new
 
       // Get the two planes variables and their cp values
       auto plane_new = state->_features_PLANE.at(planeid_new);
@@ -705,7 +715,7 @@ void StateHelper::merge_planes_and_marginalize(std::shared_ptr<State> state, con
 
       // Construct linear system
       double white_c = 1.0 / state->_options.sigma_plane_merge;
-      Eigen::Vector3d res = white_c * (Eigen::Vector3d::Zero() - (cp_new - cp_old));
+      Eigen::Vector3d res = white_c * (Eigen::Vector3d::Zero() - (cp_new - cp_old));    //残差:两个大平面特征的法向n的向量差
       Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3, 6);
       H.block(0, 0, 3, 3) = white_c * Eigen::Matrix3d::Identity();
       H.block(0, 3, 3, 3) = -white_c * Eigen::Matrix3d::Identity();
@@ -721,7 +731,7 @@ void StateHelper::merge_planes_and_marginalize(std::shared_ptr<State> state, con
 
       // Update if it passes the chi2 threshold
       if (chi2 < chi2_check && norm_angle < state->_options.plane_merge_deg_max) {
-        StateHelper::EKFUpdate(state, H_order, H, res, R);
+        StateHelper::EKFUpdate(state, H_order, H, res, R);  //用上面的残差约束来eskf后验刷新滑窗内所有状态
         PRINT_INFO(BOLDRED "[PLANE-MARG]: plane %zu -> %d passed with %.2f deg diff (%.3f < %.3f)!\n" RESET, planeid, planeid_new,
                    norm_angle, chi2, chi2_check);
       } else {
@@ -730,7 +740,7 @@ void StateHelper::merge_planes_and_marginalize(std::shared_ptr<State> state, con
       }
 
       // Marginalize the old plane
-      StateHelper::marginalize(state, plane_old);
+      StateHelper::marginalize(state, plane_old);           //将滑窗中的大平面特征直接边缘化掉,保留追踪上的大平面
       it5 = state->_features_PLANE.erase(it5);
     }
   }
@@ -743,12 +753,12 @@ void StateHelper::merge_planes_and_marginalize(std::shared_ptr<State> state, con
   // Now try to marginalize planes if needed
   // If no features see the plane, then we can remove it
   it5 = state->_features_PLANE.begin();
-  while (it5 != state->_features_PLANE.end()) {
+  while (it5 != state->_features_PLANE.end()) {//遍历滑窗中的大平面特征
     std::string status = (active_planes.find((*it5).first) == active_planes.end()) ? "marg" : "active";
     PRINT_DEBUG(BOLDRED "[PLANE-MARG]: plane %zu -> %.3f, %.3f, %.3f (%s)\n" RESET, (*it5).first, (*it5).second->value()(0),
                 (*it5).second->value()(1), (*it5).second->value()(2), status.c_str());
     // std::cout << StateHelper::get_marginal_covariance(state, {(*it5).second}) << std::endl << std::endl;
-    if (active_planes.find((*it5).first) == active_planes.end()) {
+    if (active_planes.find((*it5).first) == active_planes.end()) {//如果滑窗中大平面特征没有被追踪到,就被直接边缘化掉,并从滑窗中删除
       StateHelper::marginalize(state, (*it5).second);
       it5 = state->_features_PLANE.erase(it5);
     } else {

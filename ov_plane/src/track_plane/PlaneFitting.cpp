@@ -40,6 +40,14 @@
 using namespace ov_core;
 using namespace ov_plane;
 
+
+//拟合平面:求解Ax=b的线性方程
+  //线性方程有效性check:要求A的svd分解奇异值,s(0)/s(2) < 50.  就是保证A矩阵的满秩?
+  //平面方程有效性check:原点到平面的距离要求至少大于5厘米
+//feats:输入用于拟合平面的点集
+//abcd:平面方程参数
+//cond_thresh:线性方程chec阈值
+//cond_check:平面方程距离check阈值
 bool PlaneFitting::fit_plane(const std::vector<std::shared_ptr<ov_core::Feature>> &feats, Eigen::Vector4d &abcd, double cond_thresh,
                              bool cond_check) {
 
@@ -50,6 +58,10 @@ bool PlaneFitting::fit_plane(const std::vector<std::shared_ptr<ov_core::Feature>
   }
 
   // Linear system
+  // 平面方程:P^T * n + 1 = 0
+  // 可以求解线性方程An=b得到齐次法向n
+  // 线性方程有效性check:A的svd分解奇异值,s(0)/s(2) < 50.  就是保证A矩阵的满秩?
+  // 求解的平面方程有效性check:原点到平面的距离要求至少大于5厘米
   Eigen::MatrixXd A = Eigen::MatrixXd::Zero((int)feats.size(), 3);
   Eigen::VectorXd b = -Eigen::VectorXd::Ones((int)feats.size(), 1);
   for (size_t i = 0; i < feats.size(); i++) {
@@ -72,14 +84,22 @@ bool PlaneFitting::fit_plane(const std::vector<std::shared_ptr<ov_core::Feature>
   // d = 1.0
   abcd(3) = 1.0;
   // Divide the whole vector by the norm of the normal direction of the plane
-  abcd /= abcd.head(3).norm();
+  abcd /= abcd.head(3).norm();//将法向还原为单位法向
 
   // Check if the plane is invalid (depth of plane near zero)
   double dist_thresh = 0.02;
-  Eigen::Vector3d cp = -abcd.head(3) * abcd(3);
+  Eigen::Vector3d cp = -abcd.head(3) * abcd(3); //abcd.head(3)模长本来就是1,所以cp模长结果应该就是截距d,即原点到面的距离.
   return (cp.norm() > dist_thresh);
 }
 
+//随机采样5点拟合平面:内点距离阈值是5厘米
+  //有效平面要求内点数至少10个内点 && 内点数占比至少0.8
+//记录最佳内点集合为best_inliers,最小平均err为best_error,并用内点集重新拟合平面
+//params:
+  //feats:输入待拟合点集
+  //plane_abcd:拟合的平面结果
+  //min_inlier_num:内点数最小阈值
+  //max_plane_solver_condition_number:An=b,线性方程解平面时,A矩阵的check阈值
 bool PlaneFitting::plane_fitting(std::vector<std::shared_ptr<ov_core::Feature>> &feats, Eigen::Vector4d &plane_abcd, int min_inlier_num,
                                  double max_plane_solver_condition_number) {
   // RANSAC params for plane fitting
@@ -99,13 +119,17 @@ bool PlaneFitting::plane_fitting(std::vector<std::shared_ptr<ov_core::Feature>> 
   }
 
   // Solve by ransace if we have enough features
+  //随机采样5点拟合平面:内点距离阈值是5厘米
+    //有效平面要求内点数至少10个内点 && 内点数占比至少0.8
+  //记录最佳内点集合为best_inliers,最小平均err为best_error
   double best_error = -1;
   std::vector<std::shared_ptr<ov_core::Feature>> best_inliers;
   for (size_t n = 0; n < max_iter_num; n++) {
 
     // Create a random set of features
+    // 输入点集,随机采样5个点:5个点两两间距离都必须大于5厘米
     std::vector<std::shared_ptr<ov_core::Feature>> feat_vec_copy = feats;
-    std::vector<std::shared_ptr<ov_core::Feature>> ransac_set;
+    std::vector<std::shared_ptr<ov_core::Feature>> ransac_set;            //随机采样的5点结果
     std::shuffle(feat_vec_copy.begin(), feat_vec_copy.end(), rand_gen);
 
     // Loop until we have enough points or when we run out of option
@@ -140,6 +164,13 @@ bool PlaneFitting::plane_fitting(std::vector<std::shared_ptr<ov_core::Feature>> 
     }
 
     // Try to solve the plane when we have enough features
+    //5点拟合平面:求解Ax=b的线性方程
+      //线性方程有效性check:要求A的svd分解奇异值,s(0)/s(2) < 50.  就是保证A矩阵的满秩?
+      //平面方程有效性check:原点到平面的距离要求至少大于5厘米    
+    
+    //内点统计:
+      //内点阈值-点面距离5厘米;
+      //内点数check:至少10个内点 && 内点数占比至少0.8
     if (fit_plane(ransac_set, plane_abcd, max_plane_solver_condition_number)) {
 
       // Check the other p_FinG and check the number of iniliers
@@ -194,6 +225,24 @@ bool PlaneFitting::plane_fitting(std::vector<std::shared_ptr<ov_core::Feature>> 
   return false;
 }
 
+// 初始化单个大平面参数cp后,利用单个大平面的观测小点,构建点的BA残差和点面距离残差,对相关的面特征参数cp,点特征坐标,相机pose(fixed),相机内参和外参(fixed)作联合优化
+// 观测:
+    // (一)点BA观测:
+    // 平面观测:
+// 涉及状态:
+    // (Π1)单个大平面参数<ceres_cp>: 正常可优化状态,(但是fix_plane=true开关可以强制设为fixed)
+    // (x1)追踪到单个大平面的点特征<ceres_vars_feat>: 正常可优化状态.(但是BA观测数为0的被强制设置为fixed)
+    // (x2)追踪到大平面的相机帧pose<ceres_vars_ori/pos>: fixed
+    // (x3-1)相机外参<ceres_vars_calib_cam2imu_ori/pos>: fixed
+    // (x3-2)相机内参<ceres_vars_calib_cam_intrinsics>: fixed
+// 优化问题构建:
+// 执行完最小二乘优化,得到优化后的:1)大平面参数--cp_inG.2)小点修正坐标--feats[i]->p_FinG,3)满足距离要求的内点集合替换原输入点集--feats
+
+//param:
+  //feats:单个大平面的观测小点集合作为输入. !!优化完成后,无效的外点会被剔除!!
+  //cp_inG:单个平面初始化参数:-法向n*截距d !!优化完成后,被替换为优化后平面参数!!
+  //clonesCAM:
+  // 
 bool PlaneFitting::optimize_plane(std::vector<std::shared_ptr<ov_core::Feature>> &feats, Eigen::Vector3d &cp_inG,
                                   std::unordered_map<size_t, std::unordered_map<double, ov_core::FeatureInitializer::ClonePose>> &clonesCAM,
                                   double sigma_px_norm, double sigma_c, bool fix_plane, const Eigen::VectorXd &stateI,
@@ -219,46 +268,58 @@ bool PlaneFitting::optimize_plane(std::vector<std::shared_ptr<ov_core::Feature>>
   ceres::Problem problem;
 
   // 3d features in global
-  std::map<size_t, int> map_features;
-  std::vector<double *> ceres_vars_feat;
+  std::map<size_t, int> map_features;   //(x1)存储的是点特征索引idx. {点特征id, 点特征状态在下面缓存列表的指针序号}
+  std::vector<double *> ceres_vars_feat;//点特征状态作为ceres优化参数指针,专门缓存.
+                                          //具体索引序号idx存储在 map_features 
 
   // cp plane
   auto *ceres_cp = new double[3];
   ceres_cp[0] = cp_inG(0);
   ceres_cp[1] = cp_inG(1);
   ceres_cp[2] = cp_inG(2);
-  problem.AddParameterBlock(ceres_cp, 3);
+  problem.AddParameterBlock(ceres_cp, 3);             //(Π1)大平面特征作为估计参数
   if (fix_plane) {
-    problem.SetParameterBlockConstant(ceres_cp);
+    problem.SetParameterBlockConstant(ceres_cp);      //(Π1)依开关置为fixed
   }
 
   // FIXED: camera poses for each cam_id, indexed by time
-  std::map<size_t, std::map<double, int>> map_states;
-  std::vector<double *> ceres_vars_ori;
+  // 不同帧的相机pose,作为平面观测的状态输入,也作为状态
+      //记录相机pose状态在ceres优化参数中的位序
+  std::map<size_t, std::map<double, int>> map_states;   //(x2)存储的是相机帧pose的索引idx. 二级key记录--{相机id : {帧stamp : 相机状态在缓存列表的索引idx}}
+                                                          //大平面特征可能被不同相机观测到,相机id作为一级key
+                                                          //大平面特征可能被同一个相机有多帧观测到,不同帧时间戳作为二级key
+                                                          //具体值是,具体相机帧pose状态,在(同一个相机下)ceres优化参数中的位序.用来作为下面指针列表的索引idx
+  
+  std::vector<double *> ceres_vars_ori;                   //相机帧pose状态作为ceres优化参数指针,专门缓存.
+                                                          //具体索引序号idx存储在 map_states 
   std::vector<double *> ceres_vars_pos;
 
   // FIXED: extrinsic calibration q_ItoC, p_IinC (map from camera id to index)
-  std::map<size_t, int> map_calib_cam2imu;
+  std::map<size_t, int> map_calib_cam2imu;              //(x3-1)存储的是相机外参的索引idx. {相机id : 相机外参在缓存列表的索引idx}
   std::vector<double *> ceres_vars_calib_cam2imu_ori;
   std::vector<double *> ceres_vars_calib_cam2imu_pos;
 
   // FIXED: intrinsic calibration focal, center, distortion (map from camera id to index)
-  std::map<size_t, int> map_calib_cam;
+  std::map<size_t, int> map_calib_cam;                  //(x3-2)存储的是相机内参的索引idx. {相机id : 相机内参在缓存列表的索引idx}
   std::vector<double *> ceres_vars_calib_cam_intrinsics;
 
   // Helper function that will append a new constraint factor to ceres problem
+  //总的残差约束有点特征Pw重投影残差,点Pw到面cp距离残差
+  //(二)点面残差:下面流程主要在构建点的BA残差,每个点BA残差构建结束时,顺便构建点面距离残差: 
+          // 注意!!!!!!!!!点特征有一个视觉BA观测,就添加一个点面残差??
   auto add_constraint = [&](const std::shared_ptr<ov_core::Feature> &feat, double inflation = 1.0) {
     std::vector<double *> factor_params_const;
-    factor_params_const.push_back(ceres_vars_feat.at(map_features.at(feat->featid)));
-    factor_params_const.push_back(ceres_cp);
-    auto *factor_const = new Factor_PointOnPlane(inflation * sigma_c);
+    factor_params_const.push_back(ceres_vars_feat.at(map_features.at(feat->featid))); //(x1)点特征作为估计状态添加进ceres
+    factor_params_const.push_back(ceres_cp);                                          //(Π1)面特征作为估计状态添加进ceres
+    auto *factor_const = new Factor_PointOnPlane(inflation * sigma_c);          //(二)点面距离残差
     // ceres::LossFunction *loss_function_const = nullptr;
     ceres::LossFunction *loss_function_const = new ceres::CauchyLoss(1.0);
     problem.AddResidualBlock(factor_const, loss_function_const, factor_params_const);
   };
 
   // Loop through each feature
-  for (auto const &feat : feats) {
+  //(一)构建纯点特征的观测方程(和平面特征无关)
+  for (auto const &feat : feats) {    //feat:匹配到大平面的单个小特征点
 
     // Append this feature estimate
     assert(map_features.find(feat->featid) == map_features.end());
@@ -266,9 +327,9 @@ bool PlaneFitting::optimize_plane(std::vector<std::shared_ptr<ov_core::Feature>>
     for (int i = 0; i < 3; i++) {
       var_feat[i] = feat->p_FinG(i);
     }
-    problem.AddParameterBlock(var_feat, 3);
-    map_features.insert({feat->featid, (int)ceres_vars_feat.size()});
-    ceres_vars_feat.push_back(var_feat);
+    problem.AddParameterBlock(var_feat, 3);                           //(x1)点特征作为估计状态添加进ceres
+    map_features.insert({feat->featid, (int)ceres_vars_feat.size()}); //记录点特征在ceres指针缓存中的位序
+    ceres_vars_feat.push_back(var_feat);                              //点特征在ceres指针缓存
 
     // Count number of measurements
     int ct_meas = 0;
@@ -278,11 +339,12 @@ bool PlaneFitting::optimize_plane(std::vector<std::shared_ptr<ov_core::Feature>>
     // For slam feature we don't change their estimate
     if (ct_meas == 0) {
       problem.SetParameterBlockConstant(var_feat);
-      add_constraint(feat, slam_inflation);
+      add_constraint(feat, slam_inflation);                           //slam特征:fixed
     }
 
     // Loop through each camera for this feature
-    for (auto const &pair : feat->timestamps) {
+    for (auto const &pair : feat->timestamps) {//feat:匹配到大平面的单个小特征点
+                                                //pair:单个小特征点对应单个相机所有观测列表
 
       // State poses
       size_t cam_id = pair.first;
@@ -291,6 +353,7 @@ bool PlaneFitting::optimize_plane(std::vector<std::shared_ptr<ov_core::Feature>>
       }
 
       // Camera extrinsics (identity since poses are camera frame)
+      // 相机外参:fixed
       if (map_calib_cam2imu.find(cam_id) == map_calib_cam2imu.end()) {
         auto *var_calib_ori = new double[4];
         auto *var_calib_pos = new double[3];
@@ -300,16 +363,17 @@ bool PlaneFitting::optimize_plane(std::vector<std::shared_ptr<ov_core::Feature>>
         }
         var_calib_ori[3] = 1.0;
         auto ceres_calib_jplquat = new ov_init::State_JPLQuatLocal();
-        problem.AddParameterBlock(var_calib_ori, 4, ceres_calib_jplquat);
+        problem.AddParameterBlock(var_calib_ori, 4, ceres_calib_jplquat);               //(x3-1)相机外参作为估计状态
         problem.AddParameterBlock(var_calib_pos, 3);
-        map_calib_cam2imu.insert({cam_id, (int)ceres_vars_calib_cam2imu_ori.size()});
-        ceres_vars_calib_cam2imu_ori.push_back(var_calib_ori);
+        map_calib_cam2imu.insert({cam_id, (int)ceres_vars_calib_cam2imu_ori.size()});   //记录相机外参在ceres指针缓存中的位序
+        ceres_vars_calib_cam2imu_ori.push_back(var_calib_ori);                          //相机外参在ceres指针缓存
         ceres_vars_calib_cam2imu_pos.push_back(var_calib_pos);
-        problem.SetParameterBlockConstant(var_calib_ori);
+        problem.SetParameterBlockConstant(var_calib_ori);                               //相机外参置为fixed
         problem.SetParameterBlockConstant(var_calib_pos);
       }
 
       // Camera intrinsics
+      //相机内参:fixed
       bool is_fisheye = false;
       if (map_calib_cam.find(cam_id) == map_calib_cam.end()) {
         auto *var_calib_cam = new double[8];
@@ -317,14 +381,16 @@ bool PlaneFitting::optimize_plane(std::vector<std::shared_ptr<ov_core::Feature>>
         var_calib_cam[1] = 1.0;
         for (int i = 2; i < 8; i++)
           var_calib_cam[i] = 0.0;
-        problem.AddParameterBlock(var_calib_cam, 8);
-        map_calib_cam.insert({cam_id, (int)ceres_vars_calib_cam_intrinsics.size()});
-        ceres_vars_calib_cam_intrinsics.push_back(var_calib_cam);
-        problem.SetParameterBlockConstant(var_calib_cam);
+        problem.AddParameterBlock(var_calib_cam, 8);                                    //(x3-2)相机内参作为估计状态
+        map_calib_cam.insert({cam_id, (int)ceres_vars_calib_cam_intrinsics.size()});    //记录相机内参在ceres指针缓存中的位序
+        ceres_vars_calib_cam_intrinsics.push_back(var_calib_cam);                       //相机内参在ceres指针缓存
+        problem.SetParameterBlockConstant(var_calib_cam);                               //相机内参置为fixed
       }
 
       // Measurements
-      for (size_t m = 0; m < feat->timestamps.at(pair.first).size(); m++) {
+      for (size_t m = 0; m < feat->timestamps.at(pair.first).size(); m++) {//feat:匹配到大平面的单个小特征点
+                                                                            //pair:单个小特征点对应单个相机所有观测列表
+                                                                            //m:  单个小特征单个相机观测列表的第m个具体观测帧
 
         // Get the position of this clone in the global
         double timestamp = feat->timestamps[pair.first].at(m);
@@ -332,6 +398,8 @@ bool PlaneFitting::optimize_plane(std::vector<std::shared_ptr<ov_core::Feature>>
         Eigen::Vector3d p_CiinG = clonesCAM.at(pair.first).at(timestamp).pos();
 
         // Append to ceres problem if we don't have this state
+        //相机帧pose作为估计状态
+        //fixed
         if (map_states.at(cam_id).find(timestamp) == map_states.at(cam_id).end()) {
           auto *var_ori = new double[4];
           for (int i = 0; i < 4; i++) {
@@ -342,34 +410,35 @@ bool PlaneFitting::optimize_plane(std::vector<std::shared_ptr<ov_core::Feature>>
             var_pos[i] = p_CiinG(i);
           }
           auto ceres_jplquat = new ov_init::State_JPLQuatLocal();
-          problem.AddParameterBlock(var_ori, 4, ceres_jplquat);
+          problem.AddParameterBlock(var_ori, 4, ceres_jplquat);                         //(x2)相机帧pose作为估计状态
           problem.AddParameterBlock(var_pos, 3);
-          map_states.at(cam_id).insert({timestamp, (int)map_states.at(cam_id).size()});
-          ceres_vars_ori.push_back(var_ori);
+          map_states.at(cam_id).insert({timestamp, (int)map_states.at(cam_id).size()}); //记录相机帧pose在ceres中的位序
+          ceres_vars_ori.push_back(var_ori);                                            //相机帧pose状态作为ceres优化参数指针,专门记录下
           ceres_vars_pos.push_back(var_pos);
-          problem.SetParameterBlockConstant(var_ori);
+          problem.SetParameterBlockConstant(var_ori);                                   //设置fixed不作优化
           problem.SetParameterBlockConstant(var_pos);
         }
 
         // Get measurement
-        Eigen::Vector2d uv_norm = feat->uvs_norm.at(pair.first).at(m).block(0, 0, 2, 1).cast<double>();
+        Eigen::Vector2d uv_norm = feat->uvs_norm.at(pair.first).at(m).block(0, 0, 2, 1).cast<double>();//单点特征在相机i,帧m下的像素观测值
 
         // REPROJECTION: Factor parameters it is a function of
         std::vector<double *> factor_params;
-        factor_params.push_back(ceres_vars_ori.at(map_states.at(cam_id).at(timestamp)));
+        factor_params.push_back(ceres_vars_ori.at(map_states.at(cam_id).at(timestamp)));          //(x2)相机帧pose作为估计状态
         factor_params.push_back(ceres_vars_pos.at(map_states.at(cam_id).at(timestamp)));
-        factor_params.push_back(ceres_vars_feat.at(map_features.at(feat->featid)));
-        factor_params.push_back(ceres_vars_calib_cam2imu_ori.at(map_calib_cam2imu.at(cam_id)));
+        factor_params.push_back(ceres_vars_feat.at(map_features.at(feat->featid)));               //(x1)点特征作为估计状态添
+        factor_params.push_back(ceres_vars_calib_cam2imu_ori.at(map_calib_cam2imu.at(cam_id)));   //(x3-1)相机外参作为估计状态
         factor_params.push_back(ceres_vars_calib_cam2imu_pos.at(map_calib_cam2imu.at(cam_id)));
-        factor_params.push_back(ceres_vars_calib_cam_intrinsics.at(map_calib_cam.at(cam_id)));
+        factor_params.push_back(ceres_vars_calib_cam_intrinsics.at(map_calib_cam.at(cam_id)));    //(x3-2)相机内参作为估计状态
         auto *factor_pinhole = new ov_init::Factor_ImageReprojCalib(uv_norm, sigma_px_norm, is_fisheye);
         // ceres::LossFunction *loss_function = nullptr;
         ceres::LossFunction *loss_function = new ceres::CauchyLoss(1.0);
-        problem.AddResidualBlock(factor_pinhole, loss_function, factor_params);
+        problem.AddResidualBlock(factor_pinhole, loss_function, factor_params);                   //(一)点特征Pw投影到带畸变的像素uv,与观测量构成的观测残差!
+                                                                                                  //(一)相关状态有点特征Pw,相机pose,外参Poes,内参
 
         // CONSTRAINT: Factor parameters it is a function of
         // TODO: is this better or good to do single or multiple of these?
-        add_constraint(feat);
+        add_constraint(feat);   //(二)点面残差
       }
     }
   }
@@ -424,7 +493,8 @@ bool PlaneFitting::optimize_plane(std::vector<std::shared_ptr<ov_core::Feature>>
     return false;
   }
 
-  // Update estimate of cp plane
+  // Update estimate of cp plane  
+  // 执行完最小二乘优化,得到并返回优化后的:1)单个大平面参数--cp_inG.2)小点修正坐标--feats[i]->p_FinG,3)满足距离要求的内点集合替换原输入点集--feats
   Eigen::Vector3d cp_inG_before = cp_inG;
   cp_inG(0) = ceres_cp[0];
   cp_inG(1) = ceres_cp[1];
