@@ -598,11 +598,17 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   std::vector<std::shared_ptr<ov_core::Feature>> featsup_INIT_used;
   if (state->_options.use_plane_constraint && state->_options.use_plane_slam_feats &&
       message.timestamp - startup_time >= params.dt_slam_delay) {
+    ////主干:对新提取的大面特征作初始化,并扩展滑窗状态和滑窗协方差矩阵
+    //featsup_MSCKF_plane:追踪上大平面的小特征(未按不同大平面作分类?),以MSCKF特征为主,还补充了其它有效特征
+    //featsup_INIT_used:(传入为空,应该是要返回的结果数据) 被用作大平面初始化和估计的有效点特征. 插入此列表的点特征会被从feature_vec中删除!
+    //feat2plane:次新帧所有追踪上大平面的小特征,原始记录
     updaterPLANE->init_vio_plane(state, featsup_MSCKF_plane, featsup_INIT_used, feat2plane);
   }
   rT4 = boost::posix_time::microsec_clock::local_time();
 
   // Remove any features used in the plane init
+  //feats_used_ids:所有用作大面特征初始化的点特征列表,包括msckf特征和slam特征
+  //featsup_MSCKF:保留此步骤前的featsup_MSCKF,然后把暂存的featsup_MSCKF_tmp中没有用作大面初始化的点特征叠加进来:即是 排除了用作大平面初始化的 msckf点
   std::set<size_t> feats_used_ids;
   for (auto const &feat : featsup_INIT_used)
     feats_used_ids.insert(feat->featid);
@@ -619,6 +625,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // NOTE: this should only really be used if you want to track a lot of features, or have limited computational resources
   // TODO: we should have better selection logic here (i.e. even feature distribution in the FOV etc..)
   // TODO: right now features that are "lost" are at the front of this vector, while ones at the end are long-tracks
+  // 将 featsup_MSCKF 按照追踪次数排序
   auto compare_feat = [](const std::shared_ptr<Feature> &a, const std::shared_ptr<Feature> &b) -> bool {
     size_t asize = 0;
     size_t bsize = 0;
@@ -633,6 +640,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // NOTE: we recompute the active PLANES we have
   // NOTE: if we have more then the max, we select the "best" ones (i.e. max tracks) for this update
   // NOTE: this should only really be used if you want to track a lot of features, or have limited computational resources
+  // 预先规定了msckf使用个数上限, 把 featsup_MSCKF 中超过上限点的删除
+  // 剩余的featsup_MSCKF全部叠加进 feat_do_not_add
+  // 剩余的featsup_MSCKF, 收集所有 追踪到的大平面给 current_planes
   if ((int)featsup_MSCKF.size() > state->_options.max_msckf_in_update)
     featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - state->_options.max_msckf_in_update);
   current_planes.clear();
@@ -646,22 +656,23 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Collect long-MSCKF feature we can try to update with
   // TODO: this can be an issue as we could try to update with a feature
   // TODO: that in the next frame will be a SLAM feature.... how to handle?
+  // featsup_MSCKF_extra:即是 与滑窗中大平面无关的 追踪到大平面的 msckf点
   std::vector<std::shared_ptr<Feature>> featsup_MSCKF_extra;
   if (state->_options.plane_collect_msckf_feats) {
     for (auto const &featplanepair : feat2plane) {
       size_t featid = featplanepair.first;
       size_t planeid = featplanepair.second;
       // skip if this plane is not been selected for use yet
-      if (current_planes.find(planeid) == current_planes.end())
+      if (current_planes.find(planeid) == current_planes.end()) //跳过:未被选中的大平面
         continue;
       // skip if the feature is a slam feature
-      if (feat_do_not_add.find(featid) != feat_do_not_add.end())
+      if (feat_do_not_add.find(featid) != feat_do_not_add.end())//跳过:未被选中的小特征点
         continue;
       // skip if the plane is a slam plane
-      if (state->_features_PLANE.find(planeid) != state->_features_PLANE.end())
+      if (state->_features_PLANE.find(planeid) != state->_features_PLANE.end())//跳过:已在滑窗中的大平面
         continue;
       // skip if this plane has not that many in it
-      if (plane2featct.at(planeid) < 4)
+      if (plane2featct.at(planeid) < 4)//跳过:大平面追踪点数太少
         continue;
       // else lets get it from our feature database to update with!
       std::shared_ptr<Feature> feat = trackFEATS->get_feature_database()->get_feature(featid);
@@ -680,6 +691,10 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   }
 
   // Pass them to our MSCKF updater
+  //一句话功能:对mskcf点作大面特征观测和点特征观测的eskf后验刷新.1)追踪上大面特征的,作大面特征观测刷新;2)独立的msckf点,作独立的观测刷新
+  //featsup_MSCKF:即是 排除了用作大平面初始化的 msckf点
+  //featsup_MSCKF_extra:即是 追踪到非滑窗中大平面的 msckf点
+  //feat2plane:次新帧所有追踪上大平面的小特征,原始记录
   std::vector<std::shared_ptr<ov_core::Feature>> featsup_MSCKF_used;
   updaterMSCKF->update(state, featsup_MSCKF, featsup_MSCKF_extra, featsup_MSCKF_used, feat2plane);
   rT5 = boost::posix_time::microsec_clock::local_time();
@@ -687,6 +702,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Perform SLAM delay init and update
   // NOTE: that we provide the option here to do a *sequential* update
   // NOTE: this will be a lot faster but won't be as accurate.
+  // leven: SLAM特征是一段一段作后验update,避免太多SLAM特征影响性能
   std::vector<std::shared_ptr<Feature>> feats_slam_UPDATE_TEMP;
   while (!feats_slam_UPDATE.empty()) {
     // Get sub vector of the features we will update with

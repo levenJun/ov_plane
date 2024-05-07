@@ -538,6 +538,7 @@ void StateHelper::initialize_invertible(std::shared_ptr<State> state, std::share
   //==========================================================
   //==========================================================
   // For each active variable find its M = P*H^T
+  // 这里Hx是H_R
   for (const auto &var : state->_variables) {
     // Sum up effect of each subjacobian= K_i= \sum_m (P_im Hm^T)
     Eigen::MatrixXd M_i = Eigen::MatrixXd::Zero(var->size(), res.rows());
@@ -565,19 +566,26 @@ void StateHelper::initialize_invertible(std::shared_ptr<State> state, std::share
   // Eigen::JacobiSVD<Eigen::MatrixXd> svd(H_L);
   // double cond = svd.singularValues()(0) / svd.singularValues()(svd.singularValues().size() - 1);
   // std::cout << "is invertable - " << H_L.colPivHouseholderQr().isInvertible() << " | cond = " << cond << std::endl;
+  // 这里Hf是H_L
   Eigen::MatrixXd H_Linv = H_L.colPivHouseholderQr().inverse();
   // Eigen::MatrixXd H_Linv = H_L.inverse();
+  //这里是求扩展后的 小块Pff
   Eigen::MatrixXd P_LL = H_Linv * M.selfadjointView<Eigen::Upper>() * H_Linv.transpose();
 
   // Augment the covariance matrix
+  // 2)将扩展后的总P分成4个小块,分别填充
   size_t oldSize = state->_Cov.rows();
+  //这是保持老的Pxx
   state->_Cov.conservativeResizeLike(Eigen::MatrixXd::Zero(oldSize + new_variable->size(), oldSize + new_variable->size()));
+  //这是Pxf
   state->_Cov.block(0, oldSize, oldSize, new_variable->size()).noalias() = -M_a * H_Linv.transpose();
   state->_Cov.block(oldSize, 0, new_variable->size(), oldSize) = state->_Cov.block(0, oldSize, oldSize, new_variable->size()).transpose();
+  //这是Pff
   state->_Cov.block(oldSize, oldSize, new_variable->size(), new_variable->size()) = P_LL;
 
   // Update the variable that will be initialized (invertible systems can only update the new variable).
   // However this update should be almost zero if we already used a conditional Gauss-Newton to solve for the initial estimate
+  // 1)这是新的面状态作微小刷新:H_Linv * res 就是微小刷新量
   new_variable->update(H_Linv * res);
 
   // Now collect results, and add it to the state variables

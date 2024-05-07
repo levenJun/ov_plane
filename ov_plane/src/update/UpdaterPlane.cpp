@@ -58,6 +58,29 @@ UpdaterPlane::UpdaterPlane(UpdaterOptions &options, ov_core::FeatureInitializerO
   }
 }
 
+//主干:对新提取的大面特征作初始化,并扩展滑窗状态和滑窗协方差矩阵
+//1.预处理操作,将有效的新大平面筛选出来.同时还整理好各个大平面上的追踪点.
+//4.尝试初始化新的大平面参数cp并优化之!
+  // 4-1,对单个大平面的追踪点集,用ransac线性解尝试初始化平面参数cp
+  // 4-2,再利用单个大平面的观测小点,构建点的BA残差和点面距离残差,对相关的面特征参数cp,点特征坐标,相机pose(fixed),相机内参和外参(fixed)作联合优化 .
+//5.用最小二乘优化得到面特征参数后,现将面特征作为新的状态扩充滑窗状态:状态扩充,协方差扩充.
+  //如下是对单个大面特征初始化步骤
+    //对大面的单个点特征,区分slam点和msckf点,构建总残差res:点BA和点面残差;对滑窗状态雅可比Hx,对点特征雅可比Hf,对面特征雅可比Hcp
+    //1)目标:
+      // res:点BA和点面残差
+      // Hx:
+          // slam点:对pose状态和slam点自己的雅可比
+          // msckf点:对pose状态的雅可比,对点特征自己的雅可比会被边缘化掉
+      // Hcp:对面特征雅可比
+    //2)求解步骤:
+      //直接求res,Hx,Hf,Hcp:不区分slam点和msckf点:  这里Hf就是点特征对点本身雅可比
+      //对slam点,将Hf丟进Hx中.(slam点已经是状态x):   剩余 res, Hx, Hcp
+      //对msckf点,求Hf左零空间,边缘化res,Hf,Hx,Hcp: 剩余 res, Hx, Hcp    
+    //3)将所有点的res, Hx, Hcp叠加起来
+    //4)对新增的单个大平面特征,扩展滑窗状态和协方差:基本和点特征初始化一致
+    //5)然后基于单个大平面特征所有观测(左零方程),来作ESKF后验刷新,刷新滑窗所有状态和协方差        
+    //6)将新的特征加入滑窗特征列表:state->_features_PLANE    
+
 //feature_vec:追踪上大平面的小特征(未按不同大平面作分类?),以MSCKF特征为主,还补充了其它有效特征
 //feature_vec_used:(传入为空,应该是要返回的结果数据) 被用作大平面初始化和估计的有效点特征. 插入此列表的点特征会被从feature_vec中删除!
 //feat2plane:次新帧所有追踪上大平面的小特征,原始记录
@@ -82,7 +105,7 @@ void UpdaterPlane::init_vio_plane(std::shared_ptr<State> state, std::vector<std:
   }
 
   // 1. Clean all feature measurements and make sure they all have valid clone times
-  std::vector<std::shared_ptr<ov_core::Feature>> feature_vec_valid; //整理待处理的小特征集合,整理结果重新存进此处
+  std::vector<std::shared_ptr<ov_core::Feature>> feature_vec_valid; //将输入的feature_vec重新整理,整理结果重新存进此处
                                                                           //不在原始记录feat2plane中的小特征清除掉
                                                                           //追踪的大平面已经在滑窗中的清除掉
   auto it0 = feature_vec.begin();
@@ -358,7 +381,7 @@ void UpdaterPlane::init_vio_plane(std::shared_ptr<State> state, std::vector<std:
           // msckf点:对pose状态的雅可比,对点特征自己的雅可比会被边缘化掉
       // Hcp:对面特征雅可比
     //2)求解步骤:
-      //直接求res,Hx,Hf,Hcp:不区分slam点和msckf点
+      //直接求res,Hx,Hf,Hcp:不区分slam点和msckf点:  这里Hf就是点特征对点本身雅可比
       //对slam点,将Hf丟进Hx中.(slam点已经是状态x):   剩余 res, Hx, Hcp
       //对msckf点,求Hf左零空间,边缘化res,Hf,Hx,Hcp: 剩余 res, Hx, Hcp
     
@@ -493,7 +516,7 @@ void UpdaterPlane::init_vio_plane(std::shared_ptr<State> state, std::vector<std:
     plane->set_fej(cp_inG);
 
     // Try to initialize (internally checks chi2)
-    //1)对新增的单个大平面特征,扩展滑窗状态和协方差
+    //1)对新增的单个大平面特征,扩展滑窗状态和协方差:基本和点特征初始化一致
     //2)然后基于单个大平面特征所有观测(左零方程),来作ESKF后验刷新,刷新滑窗所有状态和协方差        
     //3)将新的特征加入滑窗特征列表:state->_features_PLANE    
     if (StateHelper::initialize(state, plane, Hx_order_big, Hx_big, Hcp_big, R_big, res_big, state->_options.const_init_chi2)) {

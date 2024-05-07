@@ -62,6 +62,28 @@ UpdaterMSCKF::UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerO
   }
 }
 
+//一句话功能:对mskcf点作大面特征观测和点特征观测的eskf后验刷新.1)追踪上大面特征的,作大面特征观测刷新;2)独立的msckf点,作独立的观测刷新
+//1,特征点清理无效的观测:已经不在窗口内的帧的观测
+//2,相机状态恢复: 从imu的clone状态恢复多目相机的窗口状态
+//3-1,对特征点作三角化: 窗口内的所有特征都重新三角化? 三角化失败的直接删除
+//3-2,对大平面特征作三角化: 如果大平面已在滑窗中,直接取之;不在滑窗中,尝试多点拟合并优化得到
+// 4.观测方程作线性化,并作零空间投影
+// Get the Jacobian for this feature
+// 1)等效于点特征的jacobian_full计算
+// 2)额外,如果点特征和大平面有关联,就还考虑点面残差:
+//    2-1)点面残差, 叠加到 res 末尾
+//    2-2)对点特征雅可比, 叠加到 H_x末尾
+//    2-3)对面特征雅可比H_c_plane, 
+//        2-3-1)如果面特征在滑窗 _features_PLANE 中, 面特征作为状态叠加到H_x末尾
+//        2-3-1)如果面特征不在滑窗中(新面特征), 面特征作为特征叠加到H_f末尾
+// 5.QR分解Hcp, 可以压缩观测方程res, Hx, Hcp.
+// 6.正式作ESKF后验刷新.
+// 7.上面已经完成了和大平面有关的msckf点特征观测刷新.这些点从msckf点集合排除后还剩余很多独立msckf点.
+//   下面就是作独立的msckf点特征刷新,和openvins那一套一致 : 对特征作线性化,并作零空间投影; QR分解来对所有特征的观测数降维; 作EKF后验刷新: 基于视觉特征观测
+
+//feature_vec:即是 排除了用作大平面初始化的 msckf点
+//feature_vec_extra:即是 追踪到非滑窗中大平面的 msckf点
+//feat2plane:次新帧所有追踪上大平面的小特征,原始记录
 void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_ptr<ov_core::Feature>> &feature_vec,
                           std::vector<std::shared_ptr<ov_core::Feature>> &feature_vec_extra,
                           std::vector<std::shared_ptr<ov_core::Feature>> &feature_vec_used, const std::map<size_t, size_t> &feat2plane) {
@@ -195,6 +217,10 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   auto rT2 = boost::posix_time::microsec_clock::local_time();
 
   // For each plane we have, lets recover its CP linearization point
+  // plane_feats[planid]:     大平面所有的追踪点集合:包括msckf点和滑窗中的slam点
+  // plane_feat_count[planid]:大平面所有的追踪点计数:包括msckf点和滑窗中的slam点
+  // plane_feat_clones[planid]:大平面所有的追踪帧集合
+  // plane_estimates_cp_inG[planid]:大平面的平面参数.  如果大平面已在滑窗中,直接取之;不在滑窗中,尝试多点拟合并优化得到
   std::map<size_t, Eigen::Vector3d> plane_estimates_cp_inG;
   std::map<size_t, std::vector<std::shared_ptr<Feature>>> plane_feats; // index by plane id
   if (state->_options.use_plane_constraint && (state->_options.use_plane_constraint_msckf || state->_options.use_plane_constraint_slamu)) {
@@ -260,9 +286,11 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     }
 
     // Try to triangulate the planes
-    for (const auto &featspair : plane_feats) {
+    // plane_estimates_cp_inG[planid]: 大平面的平面参数.  如果大平面已在滑窗中,直接取之;不在滑窗中,尝试多点拟合并优化得到 
+    for (const auto &featspair : plane_feats) {//featspair:单个大平面所有的追踪点集合:包括msckf点和滑窗中的slam点 
 
       // If the plane is in the state, no need to triangulate it
+      // 滑窗中的大平面, 无需三角化,直接取已有平面参数cp
       if (state->_features_PLANE.find(featspair.first) != state->_features_PLANE.end()) {
 
         // Current state estimate
@@ -275,6 +303,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
         double sigma_c = state->_options.sigma_constraint;
         Eigen::VectorXd stateI = state->_imu->pose()->value();
         Eigen::VectorXd calib0 = state->_calib_IMUtoCAM.at(0)->value();
+        // 获取单个大平面参数cp_inG后,利用单个大平面的观测小点,构建点的BA残差和点面距离残差,对相关的面特征参数cp_inG(fixed),点特征坐标,相机pose(fixed),相机内参和外参(fixed)作联合优化   
         if (state->_options.use_refine_plane_feat &&
             !PlaneFitting::optimize_plane(plane_feats[featspair.first], cp_inG, clones_cam, sigma_px_norm, sigma_c, true, stateI, calib0))
           continue;
@@ -303,7 +332,8 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
         // Report error and append the cp plane
         double avg_error = 0.0;
-        for (const auto &feat : featspair.second)
+        for (const auto &feat : featspair.second)//featspair.second:是单个大平面对应的追踪特征点集合
+                                                   //feat:是单个特征点
           avg_error += std::abs((feat->p_FinG.transpose() * cp_inG)(0) / cp_inG.norm() - cp_inG.norm());
         avg_error /= (double)featspair.second.size();
         plane_estimates_cp_inG.insert({featspair.first, cp_inG});
@@ -311,6 +341,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
         continue;
       }
 
+      //不在滑窗中的大平面,需要自己拟合出平面参数
       // Skip the plane if not enough measurements
       // If the plane is not in the state, we need more than 3 features to do an update!
       if (featspair.second.size() < 4)
@@ -349,6 +380,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       Eigen::Vector3d cp_inG = -abcd.head(3) * abcd(3);
       Eigen::VectorXd stateI = state->_imu->pose()->value();
       Eigen::VectorXd calib0 = state->_calib_IMUtoCAM.at(0)->value();
+      // 获取单个大平面参数 cp_inG 后,利用单个大平面的观测小点,构建点的BA残差和点面距离残差,对相关的面特征参数cp_inG,点特征坐标,相机pose(fixed),相机内参和外参(fixed)作联合优化   
       if (state->_options.use_refine_plane_feat &&
           !PlaneFitting::optimize_plane(plane_feats[featspair.first], cp_inG, clones_cam, sigma_px_norm, sigma_c, false, stateI, calib0))
         continue;
@@ -409,8 +441,10 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   // ==============================================================================================================
 
   // Loop over all planes we have
-  std::set<size_t> features_used_already;
-  for (auto const &planepair : plane_estimates_cp_inG) {
+  //
+  std::set<size_t> features_used_already; //记录所有用作所有大平面 esckf后验刷新的点特征
+  for (auto const &planepair : plane_estimates_cp_inG) {//plane_estimates_cp_inG:有效的大平面集合
+                                                          //planepair:单个大平面
 
     // Get all features / variables for this plane
     // Also get if this plane is in the state vector or not
@@ -418,7 +452,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     // Otherwise we will need to nullspace project it away!!
     size_t planeid = planepair.first;
     bool is_slam_plane = (state->_features_PLANE.find(planeid) != state->_features_PLANE.end());
-    std::vector<std::shared_ptr<Feature>> features = plane_feats.at(planeid);
+    std::vector<std::shared_ptr<Feature>> features = plane_feats.at(planeid);//features:单个大平面所有的追踪点集合:包括msckf点和滑窗中的slam点 
     assert(planeid != 0);
     assert(is_slam_plane || features.size() > 3);
 
@@ -445,7 +479,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     size_t ct_meas = 0;
 
     // Compute linear system for each feature, nullspace project, and reject
-    for (auto const &feature : features) {
+    for (auto const &feature : features) {  //features:单个大平面所有的追踪点集合:包括msckf点和滑窗中的slam点 
 
       // If we are a SLAM feature, then we should append the feature Jacobian to Hx
       // Otherwise, if we are a MSCKF feature, then we should nullspace project
@@ -507,12 +541,22 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       Eigen::VectorXd res;
       std::vector<std::shared_ptr<Type>> Hx_order_tmp;
 
+      // 4,观测方程作线性化,并作零空间投影
       // Get the Jacobian for this feature
+      // 1)等效于点特征的jacobian_full计算
+      // 2)额外,如果点特征和大平面有关联,就还考虑点面残差:
+      //    2-1)点面残差, 叠加到 res 末尾
+      //    2-2)对点特征雅可比, 叠加到 H_x末尾
+      //    2-3)对面特征雅可比H_c_plane, 
+      //        2-3-1)如果面特征在滑窗 _features_PLANE 中, 面特征作为状态叠加到H_x末尾
+      //        2-3-1)如果面特征不在滑窗中(新面特征), 面特征作为特征叠加到H_f末尾        
       double sigma_c = state->_options.sigma_constraint;
       UpdaterHelper::get_feature_jacobian_full(state, feat, _options.sigma_pix, sigma_c, H_f_tmp, H_x_tmp, res, Hx_order_tmp);
 
       // Separate our the derivative in respect to the plane
       // If the plane is NOT in the state, then its jacobian is in the Hf jacobian output...
+      //拆分H_f, 取出单点特征所有观测,对,面特征雅可比H_cp
+      //拆分H_f, 取出单点特征所有观测,对,点特征雅可比H_f      
       Eigen::MatrixXd H_cp, H_f, H_x;
       std::vector<std::shared_ptr<Type>> Hx_order;
       if (is_slam_plane) {
@@ -547,6 +591,8 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       assert(H_f.rows() > 0);
 
       // Append to Hx if SLAM feature, else nullspace project (if this is a MSCKF feature)
+      //如果点特征是slam特征(即已在滑窗状态中),对点特征雅可比H_f需要叠加进H_x中
+      //如果点特征是msckf特征,对点特征雅可比H_f需要被边缘化掉:H_f左零置为0,其余的res,H_x,H_cp左零边缘化      
       if (is_slam_feature) {
         Eigen::MatrixXd H_xf = H_x;
         H_xf.conservativeResize(H_x.rows(), H_x.cols() + H_f.cols());
@@ -560,6 +606,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       }
 
       // We are good!!! Append to our large H vector
+      // 将单个小特征点的观测雅可比,叠加到大的雅可比矩阵中去.
       feat_temp.push_back(feat);
       size_t ct_hx = 0;
       for (const auto &var : Hx_order) {
@@ -575,6 +622,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       res_big.block(ct_meas, 0, res.rows(), 1) = res;
       ct_meas += res.rows();
     }
+    //上面已经完成了单个大平面所有追踪点集的观测方程和雅可比的计算,并汇总成 res_big, Hx_big, Hcp_big
 
     // Now we have stacked all features, resize to the smaller amount
     assert(ct_meas > 0);
@@ -585,22 +633,25 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     Hcp_big.conservativeResize(ct_meas, 3);
 
     // Perform measurement compression to reduce update size
+    // 5.QR分解Hcp, 可以压缩观测方程res, Hx, Hcp
     UpdaterPlane::measurement_compress_inplace(Hx_big, Hcp_big, res_big);
     assert(Hx_big.rows() > 0);
 
     // If we are a slam plane we should append it to our Hx jacobian state here and Hx_order
     // If the plane is not in the state, then lets nullspace project away the plane!
+      //如果大面特征是slam特征(即已在滑窗状态中),大面特征雅可比Hcp_big需要叠加进Hx_big中
+      //如果大面特征是msckf特征,对点特征雅可比 Hcp_big 需要被边缘化掉:Hcp_big左零置为0,其余的res_big, Hx_big 左零边缘化
     if (is_slam_plane) {
       Eigen::MatrixXd H_xcp = Hx_big;
       H_xcp.conservativeResize(Hx_big.rows(), Hx_big.cols() + Hcp_big.cols());
-      H_xcp.block(0, Hx_big.cols(), Hx_big.rows(), Hcp_big.cols()) = Hcp_big;
+      H_xcp.block(0, Hx_big.cols(), Hx_big.rows(), Hcp_big.cols()) = Hcp_big;//slam大面特征:Hcp_big需要叠加进H_x中
       std::vector<std::shared_ptr<Type>> Hxcp_order = Hx_order_big;
       Hxcp_order.push_back(state->_features_PLANE.at(planeid));
       Hx_big = H_xcp;
       Hx_order_big = Hxcp_order;
     } else {
       assert(ct_meas > 3);
-      UpdaterHelper::nullspace_project_inplace(Hcp_big, Hx_big, res_big);
+      UpdaterHelper::nullspace_project_inplace(Hcp_big, Hx_big, res_big);//msckf大面特征: Hcp_big 需要被边缘化掉
     }
 
     // Chi2 distance check
@@ -633,6 +684,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
                res_big.rows(), chi2, _options.chi2_multipler * chi2_check);
 
     // Mark features as being used here
+    // 如果有slam的点特征关联上slam的大面特征,并用作观测刷新,这里作一个记录,放进:state->_features_SLAM_to_PLANE
     for (auto const &feat : feat_temp) {
       if (feat.planeid != 0 && state->_features_SLAM.find(feat.featid) != state->_features_SLAM.end())
         state->_features_SLAM_to_PLANE[feat.featid] = feat.planeid;
@@ -644,6 +696,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     }
 
     // We are good!!! Lets update!
+    // 6.正式作ESKF后验刷新
     Eigen::MatrixXd R_big = Eigen::MatrixXd::Identity(res_big.rows(), res_big.rows());
     StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big);
   }
@@ -652,6 +705,9 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   // ==============================================================================================================
   // ==============================================================================================================
   // ==============================================================================================================
+
+  //7.上面已经完成了和大平面有关的msckf点特征观测刷新
+  // 下面就是作独立的msckf点特征刷新,和openvins那一套一致 : 对特征作线性化,并作零空间投影; QR分解来对所有特征的观测数降维; 作EKF后验刷新: 基于视觉特征观测
 
   // Remove features already used here
   std::vector<std::shared_ptr<ov_core::Feature>> feature_vec_tmp;
