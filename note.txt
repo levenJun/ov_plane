@@ -1,0 +1,25 @@
+1,主线大流程
+
+数据输入:
+    ros1_serial_msckf::main函数 -->ROS1Visualizer::callback_stereo        [图像组帧]
+                               -->ROS1Visualizer::callback_inertial      [KEY][imu组帧,正式进入imu和图像处理流程]
+                               ---->VioManager::feed_measurement_imu     [正式处理imu流程:imu的初始化,前向积分预测,ZUPT等]
+                               ------>Propagator::feed_imu               [只是缓存imu数据]
+                               ------>InertialInitializer::feed_imu [ovs][只是缓存imu数据]
+                               ------>UpdaterZeroVelocity::feed_imu [ovs][只是缓存imu数据]
+                               ---->VioManager::feed_measurement_camera  [KEY]
+                               ------>VioManager::track_image_and_update [KEY][正式处理图像流程]
+
+                               ---------->VioManager::try_to_initialize  []
+                               --------------->InertialInitializer::initialize 
+                               --------------->StaticInitializer::initialize
+
+
+                               ---------->TrackPlane::feed_new_camera      [KEY]
+                               --------------->TrackPlane::feed_monocular  [KEY]
+
+                               ---------->VioManager::do_feature_propagate_update  [KEY]
+
+
+流程入口: 
+    

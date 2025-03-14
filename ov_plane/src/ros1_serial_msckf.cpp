@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
     // IMU processing
     if (msgs.at(m).getTopic() == topic_imu) {
       // PRINT_DEBUG("processing imu = %.3f sec\n", msgs.at(m).getTime().toSec() - time_init.toSec());
-      viz->callback_inertial(msgs.at(m).instantiate<sensor_msgs::Imu>());
+      viz->callback_inertial(msgs.at(m).instantiate<sensor_msgs::Imu>());//处理imu数据+图像数据入口.正式处理流程
     }
 
     // Camera processing
@@ -269,7 +269,7 @@ int main(int argc, char **argv) {
         auto msg1 = msgs.at(camid_to_msg_index.at(1));
         used_index.insert(camid_to_msg_index.at(0)); // skip this message
         used_index.insert(camid_to_msg_index.at(1)); // skip this message
-        viz->callback_stereo(msg0.instantiate<sensor_msgs::Image>(), msg1.instantiate<sensor_msgs::Image>(), 0, 1);
+        viz->callback_stereo(msg0.instantiate<sensor_msgs::Image>(), msg1.instantiate<sensor_msgs::Image>(), 0, 1);//处理双目数据入口. 未正式处理,只是组帧缓存
       } else {
         PRINT_ERROR(RED "[SERIAL]: We currently only support 1 or 2 camera serial input....\n" RESET);
         return EXIT_FAILURE;

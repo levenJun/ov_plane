@@ -84,7 +84,7 @@ void TrackPlane::feed_new_camera(const CameraData &message) {
   // Either call our stereo or monocular version
   // If we are doing binocular tracking, then we should parallize our tracking
   if (num_images == 1) {
-    feed_monocular(message, 0);
+    feed_monocular(message, 0);//目前只支持单目的平面追踪
   } else {
     PRINT_ERROR(RED "ONLY MONO PLANE TRACKING SUPPORTED!\n" RESET);
     std::exit(EXIT_FAILURE);
@@ -670,6 +670,7 @@ void TrackPlane::perform_plane_detection_monocular(size_t cam_id) {
   Eigen::Vector3d p_IinC = calib.block(4, 0, 3, 1);
 
   // Convert current CAMERA position relative to global
+  //左乘R,右t ?
   Eigen::Matrix3d R_GtoCi = R_ItoC * R_GtoI;
   Eigen::Vector3d p_CiinG = p_IinG - R_GtoCi.transpose() * p_IinC;
 

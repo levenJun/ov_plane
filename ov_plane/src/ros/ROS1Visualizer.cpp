@@ -420,7 +420,7 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
   message.am << msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z;
 
   // send it to our VIO system
-  _app->feed_measurement_imu(message);
+  _app->feed_measurement_imu(message);//处理imu,imu积分预测?
   visualize_odometry(message.timestamp);
 
   // If the processing queue is currently active / running just return so we can keep getting measurements
@@ -451,7 +451,7 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
       while (!camera_queue.empty() && camera_queue.at(0).timestamp < timestamp_imu_inC) {
         auto rT0_1 = boost::posix_time::microsec_clock::local_time();
         double update_dt = 100.0 * (timestamp_imu_inC - camera_queue.at(0).timestamp);
-        _app->feed_measurement_camera(camera_queue.at(0));
+        _app->feed_measurement_camera(camera_queue.at(0));//处理图像,包括单目/双目
         visualize();
         camera_queue.pop_front();
         auto rT0_2 = boost::posix_time::microsec_clock::local_time();
@@ -540,7 +540,7 @@ void ROS1Visualizer::callback_stereo(const sensor_msgs::ImageConstPtr &msg0, con
   }
 
   // Create the measurement
-  ov_core::CameraData message;
+  ov_core::CameraData message;//openvins的数据结构
   message.timestamp = cv_ptr0->header.stamp.toSec();
   message.sensor_ids.push_back(cam_id0);
   message.sensor_ids.push_back(cam_id1);

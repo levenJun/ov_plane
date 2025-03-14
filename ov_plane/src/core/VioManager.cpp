@@ -174,7 +174,7 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
                                                         params.zupt_noise_multiplier, params.zupt_max_disparity);
   }
 }
-
+//正式处理imu流程:imu的初始化,前向积分预测,ZUPT等
 void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
 
   // The oldest time we need IMU with is the last clone
